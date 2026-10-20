@@ -16,6 +16,98 @@
 
 #include <ArcdpsExtension/arcdps_structs.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+
+namespace
+{
+// Debug helper (opt-in via ARCDPS_MOCK_TRACE): logs every thrown C++ exception / SEH exception together with a
+// symbolized stack trace to "arcdps_mock_exceptions.log". Useful to find out where an addon throws before the
+// process is terminated (e.g. by an uncaught exception, which only shows up as 0xC0000409 in the event log).
+const char* SafeWhat(void* pObject)
+{
+	__try
+	{
+		return static_cast<std::exception*>(pObject)->what();
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return "(not a std::exception)";
+	}
+}
+
+LONG CALLBACK ExceptionLogger(PEXCEPTION_POINTERS pInfo)
+{
+	const DWORD code = pInfo->ExceptionRecord->ExceptionCode;
+	if (code != 0xE06D7363 && (code & 0xF0000000) != 0xC0000000)
+	{
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	static thread_local bool inHandler = false;
+	if (inHandler)
+	{
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	inHandler = true;
+
+	FILE* file = nullptr;
+	if (fopen_s(&file, "arcdps_mock_exceptions.log", "a") == 0 && file != nullptr)
+	{
+		const HANDLE process = GetCurrentProcess();
+		SymRefreshModuleList(process);
+
+		fprintf(file, "=== exception 0x%08lX (%s) ===\n", code, code == 0xE06D7363 ? "C++" : "SEH");
+		if (code == 0xE06D7363 && pInfo->ExceptionRecord->NumberParameters >= 2)
+		{
+			fprintf(file, "what: %s\n", SafeWhat(reinterpret_cast<void*>(pInfo->ExceptionRecord->ExceptionInformation[1])));
+		}
+
+		void* frames[40] = {};
+		const USHORT count = CaptureStackBackTrace(0, 40, frames, nullptr);
+		for (USHORT i = 0; i < count; ++i)
+		{
+			const DWORD64 address = reinterpret_cast<DWORD64>(frames[i]);
+
+			char moduleName[MAX_PATH] = "?";
+			HMODULE module = nullptr;
+			if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(frames[i]), &module))
+			{
+				GetModuleFileNameA(module, moduleName, MAX_PATH);
+			}
+
+			alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256] = {};
+			SYMBOL_INFO* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+			symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+			symbol->MaxNameLen = 255;
+			DWORD64 displacement = 0;
+			const bool hasSymbol = SymFromAddr(process, address, &displacement, symbol) != FALSE;
+
+			IMAGEHLP_LINE64 line = {};
+			line.SizeOfStruct = sizeof(line);
+			DWORD lineDisplacement = 0;
+			const bool hasLine = SymGetLineFromAddr64(process, address, &lineDisplacement, &line) != FALSE;
+
+			const char* fileName = strrchr(moduleName, '\\');
+			fprintf(file, "  #%02u %s!%s+0x%llx", i, fileName ? fileName + 1 : moduleName, hasSymbol ? symbol->Name : "?", displacement);
+			if (hasLine)
+			{
+				fprintf(file, "  (%s:%lu)", line.FileName, line.LineNumber);
+			}
+			fprintf(file, "\n");
+		}
+		fprintf(file, "\n");
+		fclose(file);
+	}
+
+	inHandler = false;
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+} // namespace
 
 extern "C" __declspec(dllexport) const wchar_t* e0();
 extern "C" __declspec(dllexport) void e3(const char* pString);
@@ -262,7 +354,20 @@ int Run(const char* pModulePath, const char* pMockFilePath, const char* pSelfPat
 	// - The fonts will be rasterized at a given size (w/ oversampling) and stored into a texture when calling ImFontAtlas::Build()/GetTexDataAsXXXX(), which ImGui_ImplXXXX_NewFrame below will call.
 	// - Read 'docs/FONTS.md' for more instructions and details.
 	// - Remember that in C/C++ if you want to include a backslash \ in a string literal you need to write a double backslash \\ !
-	//io.Fonts->AddFontDefault();
+	{
+		// Optionally merge a CJK font so translated addon strings (e.g. Chinese) can be displayed.
+		// ARCDPS_MOCK_FONT selects the font file, otherwise Microsoft JhengHei is used. Nothing is changed if the file doesn't exist.
+		const char* fontEnv = std::getenv("ARCDPS_MOCK_FONT");
+		const std::filesystem::path fontPath = fontEnv != nullptr ? std::filesystem::path(fontEnv) : std::filesystem::path("C:\\Windows\\Fonts\\msjh.ttc");
+		std::error_code fontError;
+		if (std::filesystem::exists(fontPath, fontError))
+		{
+			io.Fonts->AddFontDefault();
+			ImFontConfig cjkConfig;
+			cjkConfig.MergeMode = true;
+			io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 16.0f, &cjkConfig);
+		}
+	}
 	//io.Fonts->AddFontFromFileTTF("../../misc/fonts/Roboto-Medium.ttf", 16.0f);
 	//io.Fonts->AddFontFromFileTTF("../../misc/fonts/Cousine-Regular.ttf", 15.0f);
 	//io.Fonts->AddFontFromFileTTF("../../misc/fonts/DroidSans.ttf", 16.0f);
@@ -499,6 +604,14 @@ int Run(const char* pModulePath, const char* pMockFilePath, const char* pSelfPat
 // Main code
 int main(int pArgumentCount, const char** pArgumentVector)
 {
+	// Opt-in exception logging, see ExceptionLogger. Enable by setting the environment variable ARCDPS_MOCK_TRACE.
+	if (std::getenv("ARCDPS_MOCK_TRACE") != nullptr)
+	{
+		SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+		SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+		AddVectoredExceptionHandler(1, ExceptionLogger);
+	}
+
 	const char* modulePath = nullptr;
 	const char* mockFilePath = nullptr;
 	const char* selfPathString = pArgumentVector[0];
